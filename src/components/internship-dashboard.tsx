@@ -1,8 +1,12 @@
 "use client";
 
 import { useMemo, useState, useEffect } from "react";
-import { allTags, internships as seedInternships, type Internship } from "@/lib/seed-data";
+import type { User } from "@supabase/supabase-js";
+import { allTags, type Internship } from "@/lib/seed-data";
 import supabase from "@/lib/supabase";
+
+type DashboardInternship = Internship & { companyId: string | null };
+
 
 function formatStatus(status: Internship["status"]) {
   if (status === "verified_open") return "Verified open";
@@ -20,13 +24,11 @@ export function InternshipDashboard() {
   const [query, setQuery] = useState("");
   const [tag, setTag] = useState("All");
   const [level, setLevel] = useState("All");
-  const [watchedCompanies, setWatchedCompanies] = useState<string[]>([
-    "Google",
-    "Microsoft",
-    "NVIDIA",
-  ]);
+  const [user, setUser] = useState<User | null>(null);
+  const [watchedIds, setWatchedIds] = useState<Set<string>>(new Set());
+  const [companyNames, setCompanyNames] = useState<Map<string, string>>(new Map());
 
-  const [dataInternships, setDataInternships] = useState<Internship[]>([]);
+  const [dataInternships, setDataInternships] = useState<DashboardInternship[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -36,10 +38,8 @@ export function InternshipDashboard() {
         const { data, error } = await supabase
           .from("internships")
           .select(
-            `id,title,location,status,tags,level,source,apply_url,first_seen,last_checked,summary,companies(name,careers_url,linkedin_search_template)`,
+            `id,company_id,title,location,status,tags,level,source,apply_url,first_seen,last_checked,summary,companies(name,careers_url,linkedin_search_template)`,
           );
-         console.log("DATA:", data);
-         console.log("ERROR:", error);
         if (error || !data) throw error ?? new Error("No data returned");
 
         const mapped = (data as any[]).map((r) => {
@@ -52,10 +52,11 @@ export function InternshipDashboard() {
 
           return {
             id: r.id ?? `${companyName}-${r.title}`,
+            companyId: r.company_id ?? null,
             company: companyName,
             title: r.title ?? "",
             location: r.location ?? "",
-            status: (r.status as Internship["status"]) ?? "needs_review",
+            status: (r.status as DashboardInternship["status"]) ?? "needs_review",
             tags: r.tags ?? [],
             level: r.level ?? "Unknown",
             source: r.source ?? "",
@@ -64,10 +65,19 @@ export function InternshipDashboard() {
             lastChecked: r.last_checked ?? r.lastChecked ?? "",
             summary: r.summary ?? "",
             alumniSearch,
-          } as Internship;
+          } as DashboardInternship;
         });
 
-        if (mounted) setDataInternships(mapped);
+        if (mounted) {
+          setCompanyNames(
+            new Map(
+              mapped
+                .filter((m) => m.companyId)
+                .map((m) => [m.companyId as string, m.company]),
+            ),
+          );
+          setDataInternships(mapped);
+        }
       } catch (err) {
         if (mounted) setDataInternships([]);
       } finally {
@@ -81,22 +91,41 @@ export function InternshipDashboard() {
     };
   }, []);
 
-const filteredInternships = dataInternships.filter((internship) => {
-  const normalizedQuery = query.trim().toLowerCase();
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setUser(data.session?.user ?? null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) =>
+      setUser(session?.user ?? null),
+    );
+    return () => sub.subscription.unsubscribe();
+  }, []);
 
-  const matchesQuery =
-    normalizedQuery.length === 0 ||
-    [internship.company, internship.title, internship.location, internship.summary]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase()
-      .includes(normalizedQuery);
+  useEffect(() => {
+    if (!user) {
+      setWatchedIds(new Set());
+      return;
+    }
+    supabase
+      .from("watchlists")
+      .select("company_id")
+      .then(({ data }) => setWatchedIds(new Set((data ?? []).map((r) => r.company_id))));
+  }, [user]);
 
-  const matchesTag = tag === "All" || internship.tags.includes(tag);
-  const matchesLevel = level === "All" || internship.level === level;
+  const filteredInternships = dataInternships.filter((internship) => {
+    const normalizedQuery = query.trim().toLowerCase();
 
-  return matchesQuery && matchesTag && matchesLevel;
-});
+    const matchesQuery =
+      normalizedQuery.length === 0 ||
+      [internship.company, internship.title, internship.location, internship.summary]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase()
+        .includes(normalizedQuery);
+
+    const matchesTag = tag === "All" || internship.tags.includes(tag);
+    const matchesLevel = level === "All" || internship.level === level;
+
+    return matchesQuery && matchesTag && matchesLevel;
+  });
 
   const openCount = dataInternships.filter(
     (internship) => internship.status === "verified_open",
@@ -105,12 +134,32 @@ const filteredInternships = dataInternships.filter((internship) => {
     internship.tags.includes("Underclassmen"),
   ).length;
 
-  function toggleWatch(company: string) {
-    setWatchedCompanies((current) =>
-      current.includes(company)
-        ? current.filter((item) => item !== company)
-        : [...current, company].sort(),
-    );
+  async function toggleWatch(companyId: string | null) {
+    if (!companyId) return;
+    if (!user) {
+      alert("Sign in to save companies to your watchlist.");
+      return;
+    }
+    const adding = !watchedIds.has(companyId);
+    setWatchedIds((current) => {
+      const next = new Set(current);
+      adding ? next.add(companyId) : next.delete(companyId);
+      return next;
+    });
+    const { error } = adding
+      ? await supabase.from("watchlists").insert({ user_id: user.id, company_id: companyId })
+      : await supabase
+        .from("watchlists")
+        .delete()
+        .eq("user_id", user.id)
+        .eq("company_id", companyId);
+    if (error && error.code !== "23505") {
+      setWatchedIds((current) => {
+        const next = new Set(current);
+        adding ? next.delete(companyId) : next.add(companyId);
+        return next;
+      });
+    }
   }
 
   return (
@@ -123,6 +172,7 @@ const filteredInternships = dataInternships.filter((internship) => {
         <a className="button button-secondary" href="#roles">
           Browse roles
         </a>
+        <AuthBar user={user} />
       </header>
 
       <section className="summary-grid" aria-label="Dashboard summary">
@@ -140,7 +190,7 @@ const filteredInternships = dataInternships.filter((internship) => {
         </div>
         <div className="metric">
           <span>Watchlist</span>
-          <strong>{watchedCompanies.length}</strong>
+          <strong>{watchedIds.size}</strong>
         </div>
       </section>
 
@@ -179,13 +229,13 @@ const filteredInternships = dataInternships.filter((internship) => {
 
       <div className="content-grid">
         <section id="roles" className="role-list" aria-label="Internship roles">
-              {loading ? (
-                <div className="empty-state">Loading internships...</div>
-              ) : filteredInternships.length === 0 ? (
+          {loading ? (
+            <div className="empty-state">Loading internships...</div>
+          ) : filteredInternships.length === 0 ? (
             <div className="empty-state">No internships match those filters yet.</div>
           ) : (
             filteredInternships.map((internship) => {
-              const isWatched = watchedCompanies.includes(internship.company);
+              const isWatched = internship.companyId ? watchedIds.has(internship.companyId) : false;
               return (
                 <article className="role-card" key={internship.id}>
                   <div className="role-header">
@@ -210,12 +260,12 @@ const filteredInternships = dataInternships.filter((internship) => {
                     ))}
                   </div>
 
-                    <div className="role-meta">
-                      <span>Level: {internship.level}</span>
-                      <span>First seen: {internship.firstSeen}</span>
-                      <span>Last checked: {internship.lastChecked}</span>
-                      <span>Source: {internship.source}</span>
-                    </div>
+                  <div className="role-meta">
+                    <span>Level: {internship.level}</span>
+                    <span>First seen: {internship.firstSeen}</span>
+                    <span>Last checked: {internship.lastChecked}</span>
+                    <span>Source: {internship.source}</span>
+                  </div>
 
                   <div className="role-actions">
                     <a className="button" href={internship.applyUrl} target="_blank">
@@ -223,7 +273,7 @@ const filteredInternships = dataInternships.filter((internship) => {
                     </a>
                     <button
                       className="button button-secondary"
-                      onClick={() => toggleWatch(internship.company)}
+                      onClick={() => toggleWatch(internship.companyId)}
                       type="button"
                     >
                       {isWatched ? "Watching" : "Watch company"}
@@ -248,24 +298,18 @@ const filteredInternships = dataInternships.filter((internship) => {
           <div>
             <h2>Company watchlist</h2>
             <p>
-              V1 stores this in browser state. Next step is Supabase so users can
-              save watchlists and receive email alerts.
-            </p>
+              Saved to your account and synced — refresh-proof.</p>
           </div>
 
           <div className="watch-list">
-            {watchedCompanies.map((company) => {
-              const companyRoles = dataInternships.filter(
-                (internship) => internship.company === company,
-              );
+            {[...watchedIds].map((companyId) => {
+              const name = companyNames.get(companyId) ?? "Unknown company";
+              const companyRoles = dataInternships.filter((i) => i.companyId === companyId);
               return (
-                <div className="watch-item" key={company}>
-                  <strong>{company}</strong>
+                <div className="watch-item" key={companyId}>
+                  <strong>{name}</strong>
                   <span>{companyRoles.length} tracked role source</span>
-                  <span>
-                    LinkedIn tip: search "{company} software engineer" with your
-                    college name.
-                  </span>
+                  <span>LinkedIn tip: search "{name} software engineer" with your college name.</span>
                 </div>
               );
             })}
@@ -273,5 +317,44 @@ const filteredInternships = dataInternships.filter((internship) => {
         </aside>
       </div>
     </main>
+  );
+}
+function AuthBar({ user }: { user: User | null }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [msg, setMsg] = useState("");
+
+  if (user) {
+    return (
+      <div className="role-actions">
+        <span>{user.email}</span>
+        <button className="button button-secondary" type="button"
+          onClick={() => supabase.auth.signOut()}>
+          Sign out
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="role-actions">
+      <input className="control" placeholder="email" value={email}
+        onChange={(e) => setEmail(e.target.value)} />
+      <input className="control" type="password" placeholder="password" value={password}
+        onChange={(e) => setPassword(e.target.value)} />
+      <button className="button" type="button" onClick={async () => {
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        setMsg(error ? error.message : "");
+      }}>
+        Sign in
+      </button>
+      <button className="button button-secondary" type="button" onClick={async () => {
+        const { error } = await supabase.auth.signUp({ email, password });
+        setMsg(error ? error.message : "Account created.");
+      }}>
+        Sign up
+      </button>
+      {msg && <span>{msg}</span>}
+    </div>
   );
 }
